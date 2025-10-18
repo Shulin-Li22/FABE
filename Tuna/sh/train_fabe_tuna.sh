@@ -6,14 +6,14 @@ export TOKENIZERS_PARALLELISM=false  # 禁用tokenizer并行度避免警告
 # --- 模型与数据路径 ---
 MODEL_PATH="/home/nfs/share-yjy/dachuang2025/models/deepseek-coder-6.7b-instruct"
 TRAIN_DATA_PATH="/home/nfs/u2023-zlb/FABE/Tuna/data/universe_data/merged_train_data.json"
-OUTPUT_DIR="/home/nfs/u2023-zlb/FABE/checkpoints/tuna-deepseek-coder-6.7b-instruct"
+OUTPUT_DIR="/home/nfs/share-yjy/dachuang2025/m2026-lsl/FABE/checkpoints/tuna-deepseek-coder-6.7b-instruct"
 LOG_DIR="logs/tuna-deepseek-coder-6.7b-instruct"
 
 mkdir -p $OUTPUT_DIR
 mkdir -p $LOG_DIR
 
 # --- 单卡 A100 80G 训练命令 ---
-python /home/nfs/u2023-zlb/FABE/Tuna/src/train_tuna.py \
+python /home/nfs/share-yjy/dachuang2025/m2026-lsl/FABE/Tuna/src/train_tuna.py \
     --model_name_or_path $MODEL_PATH \
     --data_path $TRAIN_DATA_PATH \
     --output_dir $OUTPUT_DIR \
