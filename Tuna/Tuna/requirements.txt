@@ -1,0 +1,15 @@
+numpy
+rouge_score
+fire
+sentencepiece
+wandb
+deepspeed 
+transformers 
+accelerate
+tensorboardX
+datasets
+scipy
+scikit-learn
+torch
+tqdm
+openai

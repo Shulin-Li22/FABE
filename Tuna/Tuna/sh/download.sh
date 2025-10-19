@@ -1,0 +1,1 @@
+modelscope download --model 'shakechen/Llama-2-7b-chat-hf' --local_dir 'Llama-2-7b-chat-hf'

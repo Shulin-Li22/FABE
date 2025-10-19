@@ -2,6 +2,7 @@ checkpoints
 OpenBackdoor/datasets/SentimentAnalysis
 poison_data
 data
+outputs
 # 忽略系统文件
 .DS_Store
 Thumbs.db

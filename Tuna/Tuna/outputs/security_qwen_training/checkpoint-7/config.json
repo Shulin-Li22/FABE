@@ -1,0 +1,13 @@
+{
+  "architectures": [
+    "SecurityQwenModel"
+  ],
+  "backdoor_hidden_size": 256,
+  "base_model_name": "qwen2.5-coder",
+  "dropout_rate": 0.1,
+  "hidden_size": 4096,
+  "model_type": "security_qwen",
+  "security_hidden_size": 512,
+  "torch_dtype": "float16",
+  "transformers_version": "4.52.4"
+}
