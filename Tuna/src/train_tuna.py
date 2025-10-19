@@ -14,9 +14,13 @@
 #
 import copy
 import logging
+import os # <-- 新增导入
+import glob
+import json
+import functools # <-- 新增导入
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Sequence, Tuple, List
-from datasets import load_dataset
+
 import torch
 import torch.nn.functional as F
 import transformers
@@ -24,14 +28,16 @@ from transformers import Trainer
 from transformers import BitsAndBytesConfig
 from transformers import AutoConfig
 from transformers.utils import is_bitsandbytes_available
+from torch.utils.data import Dataset
+from datasets import load_dataset # <-- 新增导入
+
 from peft import LoraConfig, get_peft_model, PeftModel
-import itertools
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
-import torch.distributed as dist
+# 【修复 2】: 导入 QLoRA + 梯度检查点 所需的函数
+from peft import prepare_model_for_kbit_training 
+
 import utils
 from custom import TunaTrainer
-import json
-import glob
+
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -111,7 +117,7 @@ class TrainingArguments(transformers.TrainingArguments):
 
 
 def _padding_fn(tensor_list, padding_value):
-    # padding a list of tensors to the same length
+    # (此函数保留，新的 Collator 仍然需要它)
     if not isinstance(tensor_list[0], torch.Tensor):
         tensor_list = [torch.tensor(t) for t in tensor_list]
     assert (
@@ -162,197 +168,15 @@ def smart_tokenizer_and_embedding_resize(
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
 
-def _tokenize_fn(
-    sources: Sequence[str],
-    scores: Sequence[float],
-    instruction_prefix: str,
-    tokenizer: transformers.PreTrainedTokenizer,
-) -> Dict:
-    """Tokenize a list of strings."""
-    input_ids = tokenizer(
-        sources,
-        return_tensors="pt",
-        padding="longest",
-        max_length=tokenizer.model_max_length,
-        truncation=True,
-    ).input_ids
+# --- 【修复 1】: 开始重构数据处理 ---
 
-    labels = input_ids.clone()
-    labels.masked_fill_(labels == tokenizer.pad_token_id, IGNORE_INDEX)
-
-    instructions_tokenized = tokenizer(
-        instruction_prefix,
-        return_tensors="pt",
-        padding="longest",
-        max_length=tokenizer.model_max_length,
-        truncation=True,
-    ).input_ids[0]
-
-    length = instructions_tokenized.ne(tokenizer.pad_token_id).sum().item()
-    labels[:, :length] = IGNORE_INDEX
-
-    return dict(
-        input_ids=input_ids,
-        labels=labels,
-        scores=torch.tensor(scores),
-    )
-
-
-def preprocess(
-    sources: Sequence[Sequence[str]],
-    scores: Sequence[Sequence[float]],
-    instruction_prefixes: Sequence[str],
-    outputs: Sequence[Sequence[str]],
-    ids: Sequence[int],
-    tokenizer: transformers.PreTrainedTokenizer,
-) -> List[Dict]:
-    """sort the sources by scores and tokenize them."""
-    num_generations = len(sources[0])
-    assert (
-        len(set(len(s) for s in sources)) == 1
-    ), "All sources should have the same number of generations."
-    # Sort the sources by scores, keep only the source string
-    ss_sorted = [
-        sorted(zip(source, score), key=lambda x: x[1], reverse=True)
-        for source, score in zip(sources, scores)
-    ]
-    sources_sorted = [[s[0] for s in ss] for ss in ss_sorted]
-    scores_sorted = [[s[1] for s in ss] for ss in ss_sorted]
-
-    list_data_dict = [
-        _tokenize_fn(so, sc, ins_pref, tokenizer)
-        for so, sc, ins_pref in zip(sources_sorted, scores_sorted, instruction_prefixes)
-    ]
-
-    return list_data_dict
-
-
-class SupervisedDataset(Dataset):
-    """Dataset for supervised fine-tuning."""
-
-    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, model_name_or_path: str, cfg: AutoConfig, data_args: DataArguments):
-        super(SupervisedDataset, self).__init__()
-        logging.warning("Loading data...")
-        
-        # Step 1: Load all data from files matching the glob pattern
-        file_paths = glob.glob(data_path)
-        if not file_paths:
-            raise ValueError(f"No files found matching the pattern: {data_path}")
-        logging.warning(f"Found {len(file_paths)} data files.")
-
-        list_data_dict = []
-        for path in file_paths:
-            try:
-                if path.endswith('.jsonl'):
-                    with open(path, 'r', encoding='utf-8') as f:
-                        for line in f:
-                            if line.strip():
-                                list_data_dict.append(json.loads(line))
-                elif path.endswith('.json'):
-                    with open(path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        if isinstance(data, list):
-                            list_data_dict.extend(data)
-                        else:
-                            list_data_dict.append(data)
-            except Exception as e:
-                logging.error(f"Error reading or parsing file {path}: {e}")
-                raise
-
-        logging.warning(f"Loaded {len(list_data_dict)} examples in total.")
-        logging.warning("Formatting and tokenizing inputs... This may take some time...")
-
-        # Step 2: Unified processing for all loaded data
-        self.data_dict_list = []
-        template = data_args.chat_template
-        if template == "auto":
-            template = _infer_model_family(model_name_or_path, cfg)
-        sys_txt = "" if data_args.no_system else (data_args.system_prompt or "")
-
-        for item in list_data_dict:
-            # Assert necessary keys are present
-            assert "instruction" in item, f"Missing 'instruction' in item: {item}"
-            assert "output" in item and isinstance(item["output"], list), f"Missing or invalid 'output' list in item: {item}"
-            assert "score" in item and isinstance(item["score"], list), f"Missing or invalid 'score' list in item: {item}"
-            assert len(item["output"]) == len(item["score"]), f"Mismatch between number of outputs and scores in item: {item}"
-
-            # Format instruction prefix
-            instruction_prefix = _render_prefix(item["instruction"], sys_txt, template)
-            
-            # Combine prefix with each output
-            sources = [f"{instruction_prefix}{out}{tokenizer.eos_token}" for out in item["output"]]
-            scores = item["score"]
-
-            # Sort sources and scores together based on scores (descending)
-            sorted_pairs = sorted(zip(sources, scores), key=lambda x: x[1], reverse=True)
-            sources_sorted, scores_sorted = zip(*sorted_pairs)
-
-            # Tokenize the sorted data
-            tokenized_dict = _tokenize_fn(list(sources_sorted), list(scores_sorted), instruction_prefix, tokenizer)
-            self.data_dict_list.append(tokenized_dict)
-
-    def __len__(self):
-        return len(self.data_dict_list)
-
-    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        # The dictionary from _tokenize_fn already contains 'input_ids', 'labels', and 'scores'
-        return self.data_dict_list[i]
-
-
-def _tokenize(
-    sources: Sequence[Sequence[str]],
-    scores: Sequence[Sequence[float]],
-    instruction_prefixes: Sequence[str],
-    tokenizer: transformers.PreTrainedTokenizer,
-) -> Dict:
-    """Tokenize a list of strings."""
-    input_ids = [
-        tokenizer(
-            s,
-            return_tensors="pt",
-            padding="longest",
-            max_length=tokenizer.model_max_length,
-            truncation=True,
-        ).input_ids
-        for s in sources
-    ]
-
-    labels = copy.deepcopy(input_ids)
-    labels = [l.masked_fill_(l == tokenizer.pad_token_id, IGNORE_INDEX) for l in labels]
-
-    instructions_tokenized = tokenizer(
-        instruction_prefixes,
-        return_tensors="pt",
-        padding="longest",
-        max_length=tokenizer.model_max_length,
-        truncation=True,
-    ).input_ids
-
-    length = instructions_tokenized.ne(tokenizer.pad_token_id).sum(dim=-1).tolist()
-    for i, l in enumerate(length):
-        labels[i][:, :l] = IGNORE_INDEX
-
-    # 确保scores是tensor格式
-    if isinstance(scores[0], (list, tuple)):
-        # 如果scores是嵌套列表，展平它
-        flattened_scores = []
-        for score_list in scores:
-            if isinstance(score_list, (list, tuple)):
-                flattened_scores.extend(score_list)
-            else:
-                flattened_scores.append(score_list)
-        scores_tensor = torch.tensor(flattened_scores, dtype=torch.float32)
-    else:
-        scores_tensor = torch.tensor(scores, dtype=torch.float32)
-
-    return dict(
-        input_ids=input_ids,
-        labels=labels,
-        scores=scores_tensor,
-    )
-
+# 【删除】: _tokenize_fn (已废弃)
+# 【删除】: preprocess (已废弃)
+# 【删除】: SupervisedDataset (已废弃, 这是主要的性能瓶颈)
+# 【删除】: _tokenize (已废弃)
 
 def _infer_model_family(name: str, config: AutoConfig) -> str:
+    # (此函数保留)
     lowered = (config.model_type or "").lower()
     path_lower = (name or "").lower()
     if "deepseek" in path_lower:
@@ -371,6 +195,7 @@ def _infer_model_family(name: str, config: AutoConfig) -> str:
 
 
 def _render_prefix(instruction: str, system_prompt: str, template: str) -> str:
+    # (此函数保留)
     sys_txt = (system_prompt or "").strip()
     tpl = (template or "base").lower()
     if tpl == "base":
@@ -399,79 +224,200 @@ def _render_prefix(instruction: str, system_prompt: str, template: str) -> str:
     return f"{instruction}\n"
 
 
-def tokenize_function(examples, tokenizer, model_name_or_path: str, cfg: AutoConfig, data_args: DataArguments):
+# 【新增】: 新的并行预处理函数
+def preprocess_function(
+    examples, tokenizer, model_name_or_path: str, cfg: AutoConfig, data_args: DataArguments
+):
+    """
+    Preprocesses a batch of examples for datasets.map().
+    This replaces the slow, iterative logic in the old SupervisedDataset.
+    """
     instructions = examples["instruction"]
-    ids = examples["id"]
-    outputs = examples["output"]
-    scores = examples["score"]
-    num_generations = len(outputs[0])
-    assert (
-        len(set([len(out) for out in outputs])) == 1
-    ), f"All instructions must have {num_generations} outputs."
+    all_outputs = examples["output"]
+    all_scores = examples["score"]
 
     template = data_args.chat_template
     if template == "auto":
         template = _infer_model_family(model_name_or_path, cfg)
-
     sys_txt = "" if data_args.no_system else (data_args.system_prompt or "")
-    instruction_prefixes = [
-        _render_prefix(inst, sys_txt, template) for inst in instructions
-    ]
 
-    sources = [
-        [f"{pref}{out}{tokenizer.eos_token}" for out in output]
-        for pref, output in zip(instruction_prefixes, outputs)
-    ]
-    ss_sorted = [
-        sorted(zip(source, score), key=lambda x: x[1], reverse=True)
-        for source, score in zip(sources, scores)
-    ]
-    sources_sorted = [[s[0] for s in ss] for ss in ss_sorted]
-    scores_sorted = [[s[1] for s in ss] for ss in ss_sorted]
-
-    data_dict = _tokenize(sources_sorted, scores_sorted, instruction_prefixes, tokenizer)
+    batch_input_ids = []
+    batch_labels = []
+    batch_scores = []
     
-    # 确保返回的数据包含正确的字段名
-    if "scores" not in data_dict and "score" in data_dict:
-        data_dict["scores"] = data_dict.pop("score")
-    
-    return data_dict
+    # We iterate through the batch, but datasets.map will parallelize this
+    # across many processes.
+    for instruction, outputs, scores in zip(instructions, all_outputs, all_scores):
+        instruction_prefix = _render_prefix(instruction, sys_txt, template)
+        
+        # Tokenize the prefix to find its length (excluding padding)
+        prefix_tokens = tokenizer(
+            instruction_prefix, 
+            max_length=tokenizer.model_max_length, 
+            truncation=True,
+            add_special_tokens=False # Prefix doesn't have special tokens
+        ).input_ids
+        prefix_length = len(prefix_tokens)
 
+        # Combine prefix with each output
+        sources = [f"{instruction_prefix}{out}{tokenizer.eos_token}" for out in outputs]
+        
+        # Sort sources and scores together based on scores (descending)
+        sorted_pairs = sorted(zip(sources, scores), key=lambda x: x[1], reverse=True)
+        sources_sorted, scores_sorted = zip(*sorted_pairs)
+        
+        # Tokenize all sorted sources *without padding*
+        tokenized = tokenizer(
+            list(sources_sorted),
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            padding=False, # The Collator will handle padding
+        )
 
+        input_ids_list = []
+        labels_list = []
+
+        for input_ids_sample in tokenized.input_ids:
+            labels_sample = list(input_ids_sample)
+            
+            # Mask the prefix part
+            mask_len = min(prefix_length, len(labels_sample))
+            labels_sample[:mask_len] = [IGNORE_INDEX] * mask_len
+            
+            # Mask any pad tokens that might have been added (safety check)
+            for i in range(len(labels_sample)):
+                if labels_sample[i] == tokenizer.pad_token_id:
+                    labels_sample[i] = IGNORE_INDEX
+                    
+            input_ids_list.append(input_ids_sample)
+            labels_list.append(labels_sample)
+        
+        batch_input_ids.append(input_ids_list)
+        batch_labels.append(labels_list)
+        batch_scores.append(list(scores_sorted))
+
+    return {
+        "input_ids": batch_input_ids,
+        "labels": batch_labels,
+        "scores": batch_scores,
+    }
+
+# 【删除】: DataCollatorForSupervisedDataset (已废弃)
+
+# 【新增】: 新的数据 Collator，与 preprocess_function 配合
 @dataclass
-class DataCollatorForSupervisedDataset(object):
-    """Collate examples for supervised fine-tuning."""
-
+class DataCollatorForTunaDataset(object):
+    """
+    Collate examples for Tuna training.
+    Pads input_ids and labels, and stacks them into 3D tensors.
+    """
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple(
-            [instance[key] for instance in instances]
-            for key in ("input_ids", "labels")
-        )
-        input_ids = _padding_fn(input_ids, padding_value=self.tokenizer.pad_token_id)
-        labels = _padding_fn(labels, padding_value=IGNORE_INDEX)
+        # instances is a list of dictionaries, e.g.,
+        # [ { "input_ids": [[...], [...]], "labels": [[...], [...]], "scores": [...] }, ... ]
+        
+        all_input_ids = []
+        all_labels = []
+        all_scores = []
+        
+        for instance in instances:
+            all_input_ids.extend(instance["input_ids"])
+            all_labels.extend(instance["labels"])
+            all_scores.append(instance["scores"])
+        
+        # Pad all input_ids (num_cand * bs, variable_seq_len) to the max length
+        input_ids_padded = self.tokenizer.pad(
+            {"input_ids": all_input_ids},
+            padding="longest",
+            return_tensors="pt",
+        ).input_ids
+
+        # Pad labels manually using IGNORE_INDEX
+        labels_padded = []
+        max_len = input_ids_padded.shape[1]
+        for label_list in all_labels:
+            padded_list = label_list + [IGNORE_INDEX] * (max_len - len(label_list))
+            labels_padded.append(padded_list)
+        
+        labels_padded = torch.tensor(labels_padded, dtype=torch.long)
+        
+        # Reshape to (bs, num_cand, seq_len) for TunaTrainer
+        num_cand = len(instances[0]["input_ids"])
+        bs = len(instances)
+        
+        input_ids_padded = input_ids_padded.view(bs, num_cand, -1)
+        labels_padded = labels_padded.view(bs, num_cand, -1)
+        scores_tensor = torch.tensor(all_scores, dtype=torch.float32)
+
         return dict(
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+            input_ids=input_ids_padded,
+            labels=labels_padded,
+            scores=scores_tensor,
+            attention_mask=input_ids_padded.ne(self.tokenizer.pad_token_id),
         )
 
+# 【删除】: make_supervised_data_module (已废弃)
 
+# 【新增】: 新的数据模块构建器，使用 load_dataset 和 .map()
 def make_supervised_data_module(
-    tokenizer: transformers.PreTrainedTokenizer, data_args, model_name_or_path: str, cfg: AutoConfig
+    tokenizer: transformers.PreTrainedTokenizer, 
+    data_args: DataArguments, 
+    training_args: TrainingArguments, 
+    model_name_or_path: str, 
+    cfg: AutoConfig
 ) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = SupervisedDataset(
-        tokenizer=tokenizer, data_path=data_args.data_path, model_name_or_path=model_name_or_path, cfg=cfg, data_args=data_args
+    
+    logging.warning("Loading data files...")
+    # Use glob to find all file paths
+    file_paths = glob.glob(data_args.data_path)
+    if not file_paths:
+        raise ValueError(f"No files found matching the pattern: {data_args.data_path}")
+    logging.warning(f"Found {len(file_paths)} data files. Loading...")
+
+    # Load dataset from all files
+    raw_dataset = load_dataset("json", data_files=file_paths, split="train")
+    
+    logging.warning(f"Loaded {len(raw_dataset)} examples in total.")
+    logging.warning("Mapping and tokenizing dataset... This may take some time but will be cached.")
+
+    # Prepare the preprocessing function with fixed arguments
+    preprocess_fn_partial = functools.partial(
+        preprocess_function,
+        tokenizer=tokenizer,
+        model_name_or_path=model_name_or_path,
+        cfg=cfg,
+        data_args=data_args,
     )
-    eval_dataset = None  # optional
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+
+    # Use .map() for parallel preprocessing
+    # Adjust num_proc based on your machine's CPU cores
+    num_proc = max(os.cpu_count() // 2, 1)
+    if training_args.dataloader_num_workers > 0:
+        num_proc = min(num_proc, training_args.dataloader_num_workers)
+        
+    logging.warning(f"Using {num_proc} processes for tokenization.")
+    
+    train_dataset = raw_dataset.map(
+        preprocess_fn_partial,
+        batched=True,
+        batch_size=100, # Process in chunks of 100
+        num_proc=num_proc,
+        remove_columns=raw_dataset.column_names, # Remove old columns
+        desc="Tokenizing and formatting data",
+    )
+
+    eval_dataset = None # optional
+    data_collator = DataCollatorForTunaDataset(tokenizer=tokenizer)
+    
     return dict(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
     )
+
+# --- (数据处理重构结束) ---
 
 
 def train():
@@ -503,6 +449,14 @@ def train():
         **{k: v for k, v in load_kwargs.items() if v is not None},
     )
 
+    # 【修复 2】: 在加载模型后，应用 QLoRA + 梯度检查点 修复
+    if model_args.peft.lower() == "qlora" and training_args.gradient_checkpointing:
+        print("Preparing model for kbit training...")
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=training_args.gradient_checkpointing
+        )
+
+
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
@@ -526,6 +480,8 @@ def train():
             }
         )
     # Define PAD Token = BOS Token
+    # 【注意】: 如果 BOS token ID 不是 0，这可能导致 pad_fn 出错
+    # 但我们遵循原始代码逻辑
     tokenizer.pad_token = tokenizer.bos_token
     model.config.pad_token_id = model.config.bos_token_id
 
@@ -583,17 +539,19 @@ def train():
                 trainable_params += param.numel()
         print(f"trainable params: {trainable_params:,} || all params: {all_param:,} || trainable%: {100 * trainable_params / all_param:.2f}%")
 
-    # 直接使用SupervisedDataset，避免复杂的HuggingFace数据处理
-    print("Loading dataset using SupervisedDataset...")
-    train_dataset = SupervisedDataset(
-        tokenizer=tokenizer, 
-        data_path=data_args.data_path, 
-        model_name_or_path=model_args.model_name_or_path, 
-        cfg=config, 
-        data_args=data_args
-    )
     
-    collator = DataCollatorForSupervisedDataset(tokenizer)
+    # 【修复 1】: 使用新的并行数据加载模块
+    print("Loading and mapping dataset using .map()...")
+    data_module = make_supervised_data_module(
+        tokenizer=tokenizer, 
+        data_args=data_args, 
+        training_args=training_args, # 传入 training_args
+        model_name_or_path=model_args.model_name_or_path, 
+        cfg=config
+    )
+    train_dataset = data_module["train_dataset"]
+    collator = data_module["data_collator"]
+    
     
     # 确保模型配置正确
     print("Model configuration check:")
@@ -605,15 +563,16 @@ def train():
     model.is_parallelizable = True
     model.model_parallel = True
     
-    # 确保梯度检查点正确配置
-    if training_args.gradient_checkpointing:
+    # 【修复 2】: 确保梯度检查点正确配置
+    # 仅在 *不* 使用 QLoRA 时调用, 因为 prepare_model_for_kbit_training 已处理
+    if training_args.gradient_checkpointing and model_args.peft.lower() != "qlora":
         model.gradient_checkpointing_enable()
-        print("  Gradient checkpointing enabled")
+        print("  Gradient checkpointing enabled (non-QLoRA)")
     
     # 确保所有LoRA参数都是可训练的
     print("Parameter training status:")
     for name, param in model.named_parameters():
-        if "lora" in name.lower():
+        if "lora" in name.lower() and param.requires_grad:
             print(f"  {name}: requires_grad={param.requires_grad}, shape={param.shape}")
     
     print(f"training_args = {training_args}")
