@@ -568,7 +568,8 @@ def main():
         eval_steps=args.eval_steps if eval_dataset else None,
         save_total_limit=args.save_total_limit,
 
-        evaluation_strategy="steps" if eval_dataset else "no",
+        #evaluation_strategy="steps" if eval_dataset else "no",
+        eval_strategy="steps" if eval_dataset else "no", # <--- 修改这里
         save_strategy="steps",
         load_best_model_at_end=True if eval_dataset else False,
 

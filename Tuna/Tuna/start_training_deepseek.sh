@@ -4,7 +4,7 @@
 # 使用生成+排序损失的增强训练方法
 
 # 激活 conda 环境
-source /home/nfs/u2023-ckh/miniconda3/bin/activate fabe
+#source /home/nfs/u2023-ckh/miniconda3/bin/activate fabe
 
 export CUDA_VISIBLE_DEVICES=0
 export TOKENIZERS_PARALLELISM=false
@@ -12,8 +12,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # 路径配置
 MODEL_PATH="/home/nfs/share-yjy/dachuang2025/models/deepseek-coder-6.7b-instruct"
-DATA_DIR="/home/nfs/u2023-ckh/FABE/Tuna/data"
-OUTPUT_DIR="/home/nfs/u2023-ckh/checkpoints/backdoor_cleaner_deepseek_6.7b"
+DATA_DIR="/home/nfs/share-yjy/dachuang2025/m2026-lsl/FABE/Tuna/Tuna/data"
+OUTPUT_DIR="/home/nfs/share-yjy/dachuang2025/m2026-lsl/FABE/Tuna/Tuna/checkpoints/backdoor_cleaner_deepseek_6.7b"
 
 # 数据文件
 TRAIN_FILE="${DATA_DIR}/train.jsonl"
@@ -54,7 +54,7 @@ echo "   - LoRA: r=${LORA_R}, alpha=${LORA_ALPHA}"
 echo "💾 输出: ${OUTPUT_DIR}"
 echo "=============================================="
 
-cd /home/nfs/u2023-ckh/FABE/Tuna/src
+cd /home/nfs/share-yjy/dachuang2025/m2026-lsl/FABE/Tuna/Tuna/src
 
 # 启动训练
 nohup python train_backdoor_cleaner_with_ranking.py \
@@ -86,7 +86,7 @@ nohup python train_backdoor_cleaner_with_ranking.py \
     > ${OUTPUT_DIR}/training.log 2>&1 &
 
 TRAINING_PID=$!
-echo $TRAINING_PID > /home/nfs/u2023-ckh/FABE/Tuna/training_deepseek.pid
+echo $TRAINING_PID > /home/nfs/share-yjy/dachuang2025/m2026-lsl/FABE/Tuna/Tuna/training_deepseek.pid
 
 echo ""
 echo "✅ 训练已启动！"
