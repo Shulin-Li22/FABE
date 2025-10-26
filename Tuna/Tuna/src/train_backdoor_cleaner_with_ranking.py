@@ -313,64 +313,55 @@ class RankingEnhancedTrainer(Trainer):
 
     def _compute_ranking_loss_hybrid(self, model, inputs):
         """
-        混合策略排序损失计算（快速版）
-        
-        关键思路：
-        1. 用 torch.no_grad() 快速计算候选的困惑度分数（不保存梯度）
-        2. 将分数转换为需要梯度的tensor
-        3. 用这些分数计算ranking loss（有梯度）
-        
-        这样既快（no_grad），又能正确反向传播（loss有梯度）
+        排序损失计算（梯度可传播版）
         """
         candidate_input_ids = inputs['candidate_input_ids']  # [batch, num_candidates, seq_len]
         true_scores = inputs['candidate_scores']  # [batch, num_candidates]
 
         batch_size, num_candidates, seq_len = candidate_input_ids.shape
 
-        # === 步骤1：快速计算分数（无梯度）===
-        with torch.no_grad():  # 不保存梯度，大幅降低内存和计算时间
-            all_perplexities = []
-            
-            for cand_idx in range(num_candidates):
-                current_cand_ids = candidate_input_ids[:, cand_idx, :]
-                current_attention_mask = (current_cand_ids != self.tokenizer.pad_token_id).long()
+        # === 去掉 no_grad，让梯度可以传播 ===
+        all_perplexities = []
 
-                # 前向传播（不保存梯度）
-                candidate_outputs = model(
-                    input_ids=current_cand_ids,
-                    attention_mask=current_attention_mask,
-                )
-                
-                logits = candidate_outputs.logits  # [batch, seq_len, vocab_size]
+        for cand_idx in range(num_candidates):
+            current_cand_ids = candidate_input_ids[:, cand_idx, :]
+            current_attention_mask = (current_cand_ids != self.tokenizer.pad_token_id).long()
 
-                # 计算困惑度
-                shift_logits = logits[:, :-1, :].contiguous()
-                shift_input_ids = current_cand_ids[:, 1:].contiguous()
+            # 前向传播（保留梯度）
+            candidate_outputs = model(
+                input_ids=current_cand_ids,
+                attention_mask=current_attention_mask,
+            )
 
-                loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=self.tokenizer.pad_token_id)
-                token_losses = loss_fct(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_input_ids.view(-1)
-                )
-                token_losses = token_losses.view(batch_size, -1)
+            logits = candidate_outputs.logits  # [batch, seq_len, vocab_size]
 
-                pad_mask = (shift_input_ids == self.tokenizer.pad_token_id)
-                token_losses = token_losses.masked_fill(pad_mask, 0.0)
+            # 计算困惑度（保留梯度）
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_input_ids = current_cand_ids[:, 1:].contiguous()
 
-                sequence_lengths = (~pad_mask).sum(dim=1).float().clamp(min=1.0)
-                perplexity = token_losses.sum(dim=1) / sequence_lengths  # [batch]
-                
-                all_perplexities.append(perplexity.cpu())  # 移到CPU节省GPU内存
-            
-            # 堆叠所有困惑度
-            perplexities = torch.stack(all_perplexities, dim=1)  # [batch, num_candidates]
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=self.tokenizer.pad_token_id)
+            token_losses = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_input_ids.view(-1)
+            )
+            token_losses = token_losses.view(batch_size, -1)
 
-        # === 步骤2：转换为需要梯度的tensor ===
+            pad_mask = (shift_input_ids == self.tokenizer.pad_token_id)
+            token_losses = token_losses.masked_fill(pad_mask, 0.0)
+
+            sequence_lengths = (~pad_mask).sum(dim=1).float().clamp(min=1.0)
+            perplexity = token_losses.sum(dim=1) / sequence_lengths  # [batch]
+
+            all_perplexities.append(perplexity)
+
+        # 堆叠所有困惑度（保持在GPU上，保留梯度）
+        perplexities = torch.stack(all_perplexities, dim=1)  # [batch, num_candidates]
+
+        # === 去掉 detach，保持梯度连接 ===
         # 困惑度越低，质量越高，所以用负号
-        predicted_scores = -perplexities.to(true_scores.device)
-        predicted_scores = predicted_scores.detach().requires_grad_(True)  # 关键：detach后再加梯度
+        predicted_scores = -perplexities  # 直接使用，不detach
 
-        # === 步骤3：计算 ListMLE 排序损失（有梯度）===
+        # === 计算 ListMLE 排序损失（有梯度）===
         ranking_loss_sum = []
         for i in range(batch_size):
             sample_pred = predicted_scores[i]
