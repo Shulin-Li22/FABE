@@ -1,16 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-增强版后门清洁器：结合生成和排序损失 (已修复模板问题)
+增强版后门清洁器：结合生成和排序损失 (快速+内存优化版)
 
-训练策略：
-    1. 主要目标：生成评分最高的干净代码（交叉熵损失）
-    2. 辅助目标：学习所有候选的相对质量（排序损失）
-    3. 损失组合：alpha * 生成损失 + beta * 排序损失
-
-优势：
-    - 充分利用数据集中的所有候选和评分信息
-    - 学习候选之间的相对质量差异
-    - 提升模型的判别能力
+关键优化：
+    - 使用 torch.no_grad() 快速计算候选的困惑度分数
+    - 用分数来计算 ranking loss（分数tensor需要梯度）
+    - 这样既快速又能正确反向传播
 """
 import os
 import json
@@ -32,10 +27,7 @@ from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_tr
 
 
 class RankingEnhancedDataset(Dataset):
-    """
-    增强数据集：同时支持生成和排序
-    (已更新为使用 apply_chat_template 适配所有聊天模型)
-    """
+    """增强数据集：同时支持生成和排序"""
 
     def __init__(
             self,
@@ -45,14 +37,6 @@ class RankingEnhancedDataset(Dataset):
             score_threshold: float = 50.0,
             use_all_candidates: bool = True,
     ):
-        """
-        Args:
-            data_path: JSONL数据文件路径
-            tokenizer: 分词器
-            max_length: 最大序列长度
-            score_threshold: 干净代码的最低分数阈值
-            use_all_candidates: 是否使用所有候选（用于排序学习）
-        """
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.score_threshold = score_threshold
@@ -80,7 +64,6 @@ class RankingEnhancedDataset(Dataset):
                     outputs = sample.get('output', [])
                     scores = sample.get('score', [])
 
-                    # 数据验证
                     if not input_code or not input_code.strip():
                         skipped += 1
                         continue
@@ -90,36 +73,31 @@ class RankingEnhancedDataset(Dataset):
                         continue
 
                     if len(outputs) != len(scores):
-                        print(f"⚠️ Warning: Line {line_num} mismatched outputs/scores")
                         skipped += 1
                         continue
 
-                    # 找到最佳候选
                     max_score = max(scores)
                     max_idx = scores.index(max_score)
 
-                    # 检查长度（粗略估算：4字符≈1 token）
                     max_candidate_len = max(len(c) for c in outputs)
                     estimated_tokens = (len(input_code) + max_candidate_len) // 4
-                    if estimated_tokens > self.max_length * 1.2:  # 超过最大长度20%就跳过
+                    if estimated_tokens > self.max_length * 1.2:
                         skipped += 1
                         continue
 
-                    # 只保留评分超过阈值的样本
                     if max_score >= self.score_threshold:
                         processed_data.append({
                             'id': sample.get('id', f'sample_{line_num}'),
                             'instruction': sample.get('instruction', ''),
                             'backdoored_code': input_code,
-                            'candidates': outputs,  # 保留所有候选
-                            'scores': scores,  # 保留所有评分
-                            'best_idx': max_idx,  # 最佳候选的索引
+                            'candidates': outputs,
+                            'scores': scores,
+                            'best_idx': max_idx,
                         })
                     else:
                         skipped += 1
 
                 except json.JSONDecodeError:
-                    print(f"⚠️ Warning: Failed to parse line {line_num}")
                     skipped += 1
                     continue
 
@@ -145,87 +123,94 @@ class RankingEnhancedDataset(Dataset):
         print(f"📊 Dataset Statistics:")
         print(f"   - Total samples: {total}")
         print(f"   - Avg candidates per sample: {avg_candidates:.1f}")
-        print(f"   - Avg input length: {avg_input_len:.0f} chars")
-        print(f"   - Avg best candidate length: {avg_best_len:.0f} chars")
         print(f"   - Score range: {min(all_scores):.1f} ~ {max(all_scores):.1f}")
 
     def __len__(self) -> int:
         return len(self.data)
 
+    # def _create_messages(self, backdoored_code: str, assistant_content: str = None):
+    #     """创建适用于聊天模型的标准消息列表"""
+    #     system_prompt = "You are an AI programming assistant. Your task is to remove backdoor triggers from the code."
+    #     user_prompt = f"### Input Code:\n{backdoored_code}"
+
+    #     messages = [
+    #         {"role": "system", "content": system_prompt},
+    #         {"role": "user", "content": user_prompt}
+    #     ]
+
+    #     if assistant_content:
+    #         messages.append({"role": "assistant", "content": assistant_content})
+
+    #     return messages
+
     def _create_messages(self, backdoored_code: str, assistant_content: str = None):
         """
         创建适用于聊天模型的标准消息列表。
         """
-        # 这里的 system_prompt 可以根据需要调整
-        system_prompt = "You are an AI programming assistant. Your task is to remove backdoor triggers from the code."
+        system_prompt = """You are an AI programming assistant specializing in code security. Your task is to generate 4 diverse clean code variants that remove all backdoor triggers while preserving functionality.
 
-        user_prompt = f"### Input Code:\n{backdoored_code}"
+    Generate 4 variants using DIFFERENT approaches:
+    1. Minimal cleanup - only remove obvious backdoor patterns
+    2. Structural refactoring - reorganize code structure
+    3. Semantic transformation - rename variables, reorder statements  
+    4. Aggressive cleanup - combine multiple refactoring techniques"""
+
+        user_prompt = f"### Input Code:\n{backdoored_code}\n\n### Generate 4 Variants:"
 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ]
 
-        # 如果提供了 assistant_content，则将其添加到消息列表中（用于训练）
         if assistant_content:
             messages.append({"role": "assistant", "content": assistant_content})
 
         return messages
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """
-        使用 tokenizer.apply_chat_template 来处理数据
-        """
+        """使用 tokenizer.apply_chat_template 来处理数据"""
         sample = self.data[idx]
 
-        # === 1. 生成任务数据 (SFT on best candidate) ===
+        # === 1. 生成任务数据 ===
         best_candidate = sample['candidates'][sample['best_idx']]
 
-        # 1a. 创建包含答案的完整对话
-        # 确保添加 EOS token，这对模型知道何时停止生成至关重要
         messages_with_answer = self._create_messages(
             sample['backdoored_code'],
             best_candidate + self.tokenizer.eos_token
         )
 
-        # 关键：使用 apply_chat_template 将消息列表转换为 token IDs
         full_ids = self.tokenizer.apply_chat_template(
             messages_with_answer,
             truncation=True,
             max_length=self.max_length,
-            padding=False,  # 我们将在后面手动填充
-            add_special_tokens=False  # 模板已包含所有特殊tokens
+            padding=False,
+            add_special_tokens=False
         )
 
-        # 1b. 创建不含答案的提示，用于计算标签
         messages_prompt_only = self._create_messages(sample['backdoored_code'])
         prompt_ids = self.tokenizer.apply_chat_template(
             messages_prompt_only,
-            truncation=False,  # 提示不应被截断
+            truncation=False,
             padding=False,
             add_special_tokens=False
         )
         prompt_len = len(prompt_ids)
 
-        # 防止 prompt 本身就超过 max_length
         if prompt_len >= self.max_length:
-            # 这种情况很少见，但为了稳健性，截断 prompt
-            prompt_len = self.max_length - 10  # 至少给答案留 10 个 token
+            prompt_len = self.max_length - 10
             full_ids = full_ids[:self.max_length]
 
-        # 1c. 创建标签，-100 屏蔽提示部分
         labels = ([-100] * prompt_len) + full_ids[prompt_len:]
 
-        # --- 手动Padding ---
         padding_length = self.max_length - len(full_ids)
         if padding_length > 0:
             full_ids = full_ids + [self.tokenizer.pad_token_id] * padding_length
             labels = labels + [-100] * padding_length
-        else:  # 如果被截断了，确保标签也被截断
+        else:
             full_ids = full_ids[:self.max_length]
             labels = labels[:self.max_length]
 
-        # === 2. 排序任务数据 (Ranking for all candidates) ===
+        # === 2. 排序任务数据 ===
         candidate_encodings = []
         for candidate in sample['candidates']:
             messages_rank = self._create_messages(
@@ -233,42 +218,35 @@ class RankingEnhancedDataset(Dataset):
                 candidate + self.tokenizer.eos_token
             )
 
-            # 对每个候选都应用模板，并填充到最大长度
             cand_ids = self.tokenizer.apply_chat_template(
                 messages_rank,
                 max_length=self.max_length,
                 truncation=True,
-                padding='max_length',  # 直接填充到最大长度
+                padding='max_length',
                 add_special_tokens=False,
             )
             candidate_encodings.append(cand_ids)
 
-        # 如果候选数量为 0（不太可能，但作为保护），添加一个虚拟数据
         if not candidate_encodings:
             candidate_encodings.append(
                 [self.tokenizer.pad_token_id] * self.max_length
             )
-            sample['scores'] = [0.0]  # 确保分数列表非空
+            sample['scores'] = [0.0]
 
         return {
-            # 生成任务
             'input_ids': torch.tensor(full_ids, dtype=torch.long),
             'attention_mask': torch.tensor(
                 [1 if tid != self.tokenizer.pad_token_id else 0 for tid in full_ids],
                 dtype=torch.long
             ),
             'labels': torch.tensor(labels, dtype=torch.long),
-
-            # 排序任务
             'candidate_input_ids': torch.tensor(candidate_encodings, dtype=torch.long),
             'candidate_scores': torch.tensor(sample['scores'], dtype=torch.float),
         }
 
 
 class RankingEnhancedTrainer(Trainer):
-    """
-    增强Trainer：同时优化生成和排序
-    """
+    """增强Trainer：同时优化生成和排序（快速+内存优化版）"""
 
     def __init__(self, *args,
                  generation_weight: float = 1.0,
@@ -279,10 +257,8 @@ class RankingEnhancedTrainer(Trainer):
         self.ranking_weight = ranking_weight
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """
-        计算组合损失：生成损失 + 排序损失
-        """
-        # === 1. 生成损失（主要目标）===
+        """计算组合损失：生成损失 + 排序损失"""
+        # === 1. 生成损失 ===
         gen_inputs = {
             'input_ids': inputs['input_ids'],
             'attention_mask': inputs['attention_mask'],
@@ -291,13 +267,26 @@ class RankingEnhancedTrainer(Trainer):
         outputs = model(**gen_inputs)
         generation_loss = outputs.loss
 
-        # === 2. 排序损失（辅助目标）===
+        # === 调试输出 ===
+        debug_step = self.state.global_step % 50 == 0
+        if debug_step and self.state.is_local_process_zero:
+            print(f"\n{'='*70}")
+            print(f"🔍 Step {self.state.global_step}")
+            print(f"   Gen Loss: {generation_loss.item():.4f}")
+
+        # === 2. 排序损失（混合策略：快速+保留梯度）===
         if 'candidate_input_ids' in inputs and self.ranking_weight > 0 and \
-                inputs['candidate_input_ids'].shape[1] > 1:  # 确保至少有2个候选才能排序
+                inputs['candidate_input_ids'].shape[1] > 1:
+            
             try:
-                ranking_loss = self._compute_ranking_loss(model, inputs)
+                ranking_loss = self._compute_ranking_loss_hybrid(model, inputs)
+                
+                if debug_step and self.state.is_local_process_zero:
+                    print(f"   Rank Loss: {ranking_loss.item():.4f}")
+                    
             except Exception as e:
-                print(f"Error computing ranking loss: {e}")
+                if self.state.is_local_process_zero:
+                    print(f"\n❌ ERROR: {e}")
                 ranking_loss = torch.tensor(0.0, device=generation_loss.device)
         else:
             ranking_loss = torch.tensor(0.0, device=generation_loss.device)
@@ -307,6 +296,10 @@ class RankingEnhancedTrainer(Trainer):
                 self.generation_weight * generation_loss +
                 self.ranking_weight * ranking_loss
         )
+
+        if debug_step and self.state.is_local_process_zero:
+            print(f"   Total Loss: {total_loss.item():.4f}")
+            print(f"{'='*70}\n")
 
         # 日志
         if self.state.is_local_process_zero and self.is_in_train:
@@ -318,55 +311,66 @@ class RankingEnhancedTrainer(Trainer):
 
         return (total_loss, outputs) if return_outputs else total_loss
 
-    def _compute_ranking_loss(self, model, inputs):
+    def _compute_ranking_loss_hybrid(self, model, inputs):
         """
-        计算排序损失（Listwise Ranking Loss）
-
-        思路：
-        1. 对每个候选计算困惑度（perplexity）作为质量分数
-        2. 使用ListMLE算法学习正确的排序
+        混合策略排序损失计算（快速版）
+        
+        关键思路：
+        1. 用 torch.no_grad() 快速计算候选的困惑度分数（不保存梯度）
+        2. 将分数转换为需要梯度的tensor
+        3. 用这些分数计算ranking loss（有梯度）
+        
+        这样既快（no_grad），又能正确反向传播（loss有梯度）
         """
         candidate_input_ids = inputs['candidate_input_ids']  # [batch, num_candidates, seq_len]
         true_scores = inputs['candidate_scores']  # [batch, num_candidates]
 
         batch_size, num_candidates, seq_len = candidate_input_ids.shape
 
-        # 将所有候选展平，批量计算
-        flat_input_ids = candidate_input_ids.view(-1, seq_len)  # [batch*num_candidates, seq_len]
-        flat_attention_mask = (flat_input_ids != self.tokenizer.pad_token_id).long()
+        # === 步骤1：快速计算分数（无梯度）===
+        with torch.no_grad():  # 不保存梯度，大幅降低内存和计算时间
+            all_perplexities = []
+            
+            for cand_idx in range(num_candidates):
+                current_cand_ids = candidate_input_ids[:, cand_idx, :]
+                current_attention_mask = (current_cand_ids != self.tokenizer.pad_token_id).long()
 
-        # 计算每个候选的困惑度（作为质量的负指标）
-        with torch.no_grad():  # 评估排序时，通常不计算模型梯度，只计算loss
-            candidate_outputs = model(
-                input_ids=flat_input_ids,
-                attention_mask=flat_attention_mask,
-            )
-        # 使用负对数似然作为质量分数（越低越好 → 负号后越高越好）
-        logits = candidate_outputs.logits  # [batch*num_candidates, seq_len, vocab_size]
+                # 前向传播（不保存梯度）
+                candidate_outputs = model(
+                    input_ids=current_cand_ids,
+                    attention_mask=current_attention_mask,
+                )
+                
+                logits = candidate_outputs.logits  # [batch, seq_len, vocab_size]
 
-        # 计算平均负对数似然
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_input_ids = flat_input_ids[..., 1:].contiguous()
+                # 计算困惑度
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_input_ids = current_cand_ids[:, 1:].contiguous()
 
-        # 计算每个token的负对数似然
-        loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=self.tokenizer.pad_token_id)
-        token_losses = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_input_ids.view(-1)
-        )
-        token_losses = token_losses.view(batch_size * num_candidates, -1)
+                loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=self.tokenizer.pad_token_id)
+                token_losses = loss_fct(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_input_ids.view(-1)
+                )
+                token_losses = token_losses.view(batch_size, -1)
 
-        # 掩码掉 padding token 的
-        pad_mask = (shift_input_ids == self.tokenizer.pad_token_id)
-        token_losses.masked_fill_(pad_mask, 0.0)
+                pad_mask = (shift_input_ids == self.tokenizer.pad_token_id)
+                token_losses = token_losses.masked_fill(pad_mask, 0.0)
 
-        # 平均每个候选的损失（困惑度的proxy）
-        sequence_lengths = (~pad_mask).sum(dim=1).float().clamp(min=1.0)
-        sequence_losses = token_losses.sum(dim=1) / sequence_lengths  # [batch*num_candidates]
+                sequence_lengths = (~pad_mask).sum(dim=1).float().clamp(min=1.0)
+                perplexity = token_losses.sum(dim=1) / sequence_lengths  # [batch]
+                
+                all_perplexities.append(perplexity.cpu())  # 移到CPU节省GPU内存
+            
+            # 堆叠所有困惑度
+            perplexities = torch.stack(all_perplexities, dim=1)  # [batch, num_candidates]
 
-        predicted_scores = -sequence_losses.view(batch_size, num_candidates)  # 负号：loss越低，score越高
+        # === 步骤2：转换为需要梯度的tensor ===
+        # 困惑度越低，质量越高，所以用负号
+        predicted_scores = -perplexities.to(true_scores.device)
+        predicted_scores = predicted_scores.detach().requires_grad_(True)  # 关键：detach后再加梯度
 
-        # === ListMLE 排序损失 ===
+        # === 步骤3：计算 ListMLE 排序损失（有梯度）===
         ranking_loss_sum = []
         for i in range(batch_size):
             sample_pred = predicted_scores[i]
@@ -399,16 +403,14 @@ def str_to_bool(v):
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Train Backdoor Cleaner with Ranking Loss")
+    parser = argparse.ArgumentParser(description="Train Backdoor Cleaner (Fast + Memory Optimized)")
 
-    # 核心路径
     group = parser.add_argument_group('Core Paths')
     group.add_argument("--model_name_or_path", type=str, required=True)
     group.add_argument("--train_data_path", type=str, required=True)
     group.add_argument("--eval_data_path", type=str, default=None)
     group.add_argument("--output_dir", type=str, required=True)
 
-    # 模型配置
     group = parser.add_argument_group('Model Configuration')
     group.add_argument("--model_max_length", type=int, default=2048)
     group.add_argument("--use_lora", type=str_to_bool, default=True)
@@ -417,24 +419,19 @@ def parse_arguments():
     group.add_argument("--lora_dropout", type=float, default=0.1)
     group.add_argument("--load_in_8bit", type=str_to_bool, default=False)
 
-    # 训练超参数
     group = parser.add_argument_group('Training Hyperparameters')
     group.add_argument("--num_train_epochs", type=int, default=3)
-    group.add_argument("--per_device_train_batch_size", type=int, default=2)  # 减小，因为要处理多个候选
-    group.add_argument("--per_device_eval_batch_size", type=int, default=2)
-    group.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    group.add_argument("--per_device_train_batch_size", type=int, default=4)
+    group.add_argument("--per_device_eval_batch_size", type=int, default=4)
+    group.add_argument("--gradient_accumulation_steps", type=int, default=4)
     group.add_argument("--learning_rate", type=float, default=2e-5)
     group.add_argument("--warmup_steps", type=int, default=200)
     group.add_argument("--weight_decay", type=float, default=0.01)
 
-    # 损失权重
     group = parser.add_argument_group('Loss Weights')
-    group.add_argument("--generation_weight", type=float, default=1.0,
-                       help="Weight for generation loss (main objective)")
-    group.add_argument("--ranking_weight", type=float, default=0.3,
-                       help="Weight for ranking loss (auxiliary objective)")
+    group.add_argument("--generation_weight", type=float, default=1.0)
+    group.add_argument("--ranking_weight", type=float, default=0.3)
 
-    # 系统配置
     group = parser.add_argument_group('System Configuration')
     group.add_argument("--fp16", type=str_to_bool, default=True)
     group.add_argument("--gradient_checkpointing", type=str_to_bool, default=True)
@@ -450,13 +447,13 @@ def main():
     args = parse_arguments()
 
     print("=" * 70)
-    print("🧹 Backdoor Code Cleaner with Ranking Loss (Chat-Template-Fixed)")
+    print("🧹 Backdoor Code Cleaner (Fast + Memory Optimized)")
     print("=" * 70)
     print(f"📁 Model: {args.model_name_or_path}")
-    print(f"📁 Train data: {args.train_data_path}")
+    print(f"📁 Train: {args.train_data_path}")
     print(f"📁 Output: {args.output_dir}")
-    print(f"⚖️  Generation weight: {args.generation_weight}")
-    print(f"⚖️  Ranking weight: {args.ranking_weight}")
+    print(f"⚖️  Weights: Gen={args.generation_weight}, Rank={args.ranking_weight}")
+    print(f"⚡ Strategy: Hybrid (no_grad scoring + grad loss)")
     print("=" * 70)
 
     # 加载tokenizer
@@ -464,18 +461,15 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path,
         trust_remote_code=True,
-        padding_side='right',  # 确保 padding 在右侧
-        use_fast=False  # 某些模型 Fast tokenizer 对模板支持不完善
+        padding_side='right',
+        use_fast=False
     )
 
     if tokenizer.pad_token is None:
         if tokenizer.eos_token is not None:
-            print("   Setting pad_token = eos_token")
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id
         else:
-            # 对于 Qwen1.5 这种没有 pad_token 和 eos_token 的情况
-            print("   Setting pad_token = <|endoftext|>")
             tokenizer.add_special_tokens({'pad_token': '<|endoftext|>'})
 
     # 加载模型
@@ -486,37 +480,28 @@ def main():
     }
 
     if args.load_in_8bit:
-        print("   Using 8-bit quantization...")
         load_kwargs["load_in_8bit"] = True
     else:
         load_kwargs["torch_dtype"] = torch.float16 if args.fp16 else torch.float32
 
     model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **load_kwargs)
-
-    # 确保模型配置中的 pad_token_id 与 tokenizer 一致
     model.config.pad_token_id = tokenizer.pad_token_id
 
-    # 启用梯度检查点（在应用 LoRA 之前）
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         print("✅ Gradient checkpointing enabled")
 
-    # 应用LoRA
     if args.use_lora:
         print(f"🔧 Applying LoRA (r={args.lora_r}, alpha={args.lora_alpha})...")
 
-        # 量化模型需要特殊准备
         if args.load_in_8bit:
             model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
-            print("   Model prepared for quantized training")
         else:
-            # 非量化模型，手动启用输入嵌入的梯度（LoRA 需要）
             if hasattr(model, 'enable_input_require_grads'):
                 model.enable_input_require_grads()
             else:
                 def make_inputs_require_grad(module, input, output):
                     output.requires_grad_(True)
-
                 model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
         lora_config = LoraConfig(
@@ -524,7 +509,6 @@ def main():
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            # 目标模块可能需要根据模型调整（例如 Qwen, DeepSeek）
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             bias="none"
         )
@@ -568,8 +552,7 @@ def main():
         eval_steps=args.eval_steps if eval_dataset else None,
         save_total_limit=args.save_total_limit,
 
-        #evaluation_strategy="steps" if eval_dataset else "no",
-        eval_strategy="steps" if eval_dataset else "no", # <--- 修改这里
+        eval_strategy="steps" if eval_dataset else "no",
         save_strategy="steps",
         load_best_model_at_end=True if eval_dataset else False,
 
@@ -591,16 +574,12 @@ def main():
         ranking_weight=args.ranking_weight,
     )
 
-    # 开始训练
-    print("\n🚀 Starting training with generation + ranking loss...")
-    print("📌 Main objective: Generate clean code (generation loss)")
-    print("📌 Auxiliary objective: Learn candidate quality (ranking loss)")
+    print("\n🚀 Starting training (hybrid strategy)...")
     print("=" * 70)
 
     trainer.train()
 
-    # 保存模型
-    print("\n✅ Training completed! Saving final model...")
+    print("\n✅ Training completed! Saving model...")
     trainer.save_model()
     tokenizer.save_pretrained(args.output_dir)
 
@@ -612,8 +591,7 @@ def main():
         with open(os.path.join(args.output_dir, "eval_results.json"), "w") as f:
             json.dump(eval_results, f, indent=2)
 
-    print(f"\n🎉 All done! Model saved to {args.output_dir}")
-    print("=" * 70)
+    print(f"\n🎉 Done! Model saved to {args.output_dir}")
 
 
 if __name__ == "__main__":

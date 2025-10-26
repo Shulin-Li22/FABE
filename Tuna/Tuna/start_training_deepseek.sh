@@ -1,30 +1,26 @@
 #!/bin/bash
 
 # DeepSeek-Coder 6.7B 后门清洁器训练脚本
-# 使用生成+排序损失的增强训练方法
+# 全面性能优化版本
 
-# 激活 conda 环境
-#source /home/nfs/u2023-ckh/miniconda3/bin/activate fabe
-
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # 路径配置
 MODEL_PATH="/home/nfs/share-yjy/dachuang2025/models/deepseek-coder-6.7b-instruct"
 DATA_DIR="/home/nfs/share-yjy/dachuang2025/m2026-lsl/FABE/Tuna/Tuna/data"
-OUTPUT_DIR="/home/nfs/share-yjy/dachuang2025/m2026-lsl/FABE/Tuna/Tuna/checkpoints/backdoor_cleaner_deepseek_6.7b"
+OUTPUT_DIR="/home/nfs/share-yjy/dachuang2025/m2026-lsl/FABE/Tuna/Tuna/checkpoints/backdoor_cleaner_deepseek_6.7b_fast_variant"
 
 # 数据文件
 TRAIN_FILE="${DATA_DIR}/train.jsonl"
 VALID_FILE="${DATA_DIR}/valid.jsonl"
-TEST_FILE="${DATA_DIR}/test.jsonl"
 
-# 训练参数
+# 训练参数（性能优化）
 NUM_EPOCHS=3
-BATCH_SIZE=4              # 提高到4，利用A100 80GB的充裕显存
-GRAD_ACCUM=4              # 降到4，保持有效batch = 4*4 = 16
-MAX_LENGTH=4096           # 改为4096以覆盖更多样本
+BATCH_SIZE=8              # 提高到8（A6000 48GB足够）
+GRAD_ACCUM=4              # 降到2，有效batch=16
+MAX_LENGTH=2048           # ⚡ 关键：从4096降到2048，速度提升4倍！
 LR=2e-5
 
 # LoRA 配置
@@ -32,25 +28,25 @@ LORA_R=8
 LORA_ALPHA=16
 LORA_DROPOUT=0.1
 
-# 损失权重（FABE组合损失函数）
-GENERATION_WEIGHT=1.0    # MLE Loss: 生成干净代码
-RANKING_WEIGHT=0.3       # Listwise Ranking Loss: 保持语义一致性
+# 损失权重
+GENERATION_WEIGHT=1.0
+RANKING_WEIGHT=0.5
 
 # 创建输出目录
 mkdir -p ${OUTPUT_DIR}
 
 echo "=============================================="
-echo "🚀 开始训练 DeepSeek-Coder 6.7B 后门清洁器"
+echo "🚀 DeepSeek 6.7B 训练（性能优化版）"
 echo "=============================================="
 echo "📁 模型: ${MODEL_PATH}"
-echo "📊 数据集:"
-echo "   - 训练集: ${TRAIN_FILE} (21,854 样本)"
-echo "   - 验证集: ${VALID_FILE} (2,732 样本)"
-echo "   - 测试集: ${TEST_FILE} (2,732 样本)"
-echo "📈 训练策略:"
-echo "   - 生成损失权重: ${GENERATION_WEIGHT}"
-echo "   - 排序损失权重: ${RANKING_WEIGHT}"
-echo "   - LoRA: r=${LORA_R}, alpha=${LORA_ALPHA}"
+echo "📊 数据: ${TRAIN_FILE}"
+echo "📈 优化:"
+echo "   - 序列长度: ${MAX_LENGTH} (从4096降低)"
+echo "   - Batch size: ${BATCH_SIZE}"
+echo "   - Grad accum: ${GRAD_ACCUM}"
+echo "   - 有效batch: $((BATCH_SIZE * GRAD_ACCUM))"
+echo "   - 预计速度: ~10-12秒/步"
+echo "   - 预计总时间: ~12-14小时"
 echo "💾 输出: ${OUTPUT_DIR}"
 echo "=============================================="
 
@@ -86,23 +82,19 @@ nohup python train_backdoor_cleaner_with_ranking.py \
     > ${OUTPUT_DIR}/training.log 2>&1 &
 
 TRAINING_PID=$!
-echo $TRAINING_PID > /home/nfs/share-yjy/dachuang2025/m2026-lsl/FABE/Tuna/Tuna/training_deepseek.pid
+echo $TRAINING_PID > training_fast.pid
 
 echo ""
 echo "✅ 训练已启动！"
 echo "🔢 进程 ID: ${TRAINING_PID}"
 echo ""
 echo "📊 监控命令:"
-echo "  # 查看实时日志"
+echo "  # 实时查看日志"
 echo "  tail -f ${OUTPUT_DIR}/training.log"
 echo ""
-echo "  # 查看 TensorBoard"
-echo "  tensorboard --logdir ${OUTPUT_DIR}/logs"
+echo "  # 查看训练进度"
+echo "  tail -f ${OUTPUT_DIR}/training.log | grep 'Step\\|it/s'"
 echo ""
-echo "  # 检查进程状态"
-echo "  ps aux | grep ${TRAINING_PID}"
-echo ""
-echo "  # 查看 GPU 使用"
+echo "  # 查看GPU使用"
 echo "  watch -n 1 nvidia-smi"
 echo ""
-
